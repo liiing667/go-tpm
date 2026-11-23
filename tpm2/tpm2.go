@@ -97,6 +97,9 @@ type Command[R any, PR *R] interface {
 // authChanger is a TPM command that changes the authorization value of the
 // entity its first session authorizes. The TPM computes the response HMAC
 // after the command is executed, with the new authorization value.
+// The session's authorization value is updated atomically with the success
+// of the command (see authUpdater): it only changes once the command has
+// succeeded and its response has been authenticated.
 type authChanger interface {
 	// The new authorization value of the entity.
 	newAuth() []byte

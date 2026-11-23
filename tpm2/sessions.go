@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/google/go-tpm/tpm2/transport"
 )
@@ -54,8 +55,25 @@ type Session interface {
 // authUpdater is a session that can take the new authorization value of the
 // entity it authorizes, to validate the response of a command that changed
 // it (see authChanger).
+//
+// The new authorization value is committed atomically with the rest of the
+// authorization state of the command: updateAuth only stages the value so
+// that the response of the in-flight command can be validated (the TPM
+// computes the response HMAC of an auth-changing command with the new
+// value). The staged value replaces the session's authorization value only
+// when commitAuth is called, after the command has succeeded and its
+// response has been authenticated. If the command fails or its response
+// cannot be authenticated, rollbackAuth discards the staged value and the
+// session keeps the authorization value that still matches the TPM's
+// state.
 type authUpdater interface {
+	// updateAuth stages the new authorization value for validating the
+	// response of the in-flight auth-changing command.
 	updateAuth(auth []byte)
+	// commitAuth commits the staged authorization value, if any.
+	commitAuth()
+	// rollbackAuth discards the staged authorization value, if any.
+	rollbackAuth()
 }
 
 // CPHash calculates the TPM command parameter hash for a given Command.
@@ -332,6 +350,19 @@ type hmacSession struct {
 	nonceCaller TPM2BNonce
 	// last nonceTPM
 	nonceTPM TPM2BNonce
+	// stagedAuth, if stagedAuthSet is true, is the new authorization
+	// value of the entity this session authorizes, staged by an
+	// in-flight auth-changing command (see authChanger). The TPM
+	// computes the response HMAC of such a command with the new value,
+	// so the staged value is needed to validate the response, but it
+	// only replaces the session's authorization value once the command
+	// has succeeded and its response has been authenticated.
+	stagedAuth    []byte
+	stagedAuthSet bool
+	// mu serializes access to the mutable session state, so that
+	// concurrent commands cannot observe or create torn authorization
+	// state (e.g., a half-committed auth change or nonce roll).
+	mu sync.Mutex
 }
 
 // HMAC sets up a just-in-time HMAC session that is used only once.
@@ -397,6 +428,8 @@ func getEncryptedSalt(pub TPMTPublic) (*TPM2BEncryptedSecret, []byte, error) {
 
 // Init initializes the session, just in time, if needed.
 func (s *hmacSession) Init(t transport.TPM) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.handle != TPMRHNull {
 		// Session is already initialized.
 		return nil
@@ -452,6 +485,8 @@ func (s *hmacSession) Init(t transport.TPM) error {
 
 // Cleanup cleans up the session, if needed.
 func (s *hmacSession) CleanupFailure(t transport.TPM) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
 		return nil
@@ -466,7 +501,11 @@ func (s *hmacSession) CleanupFailure(t transport.TPM) error {
 
 // NonceTPM returns the last nonceTPM value from the session.
 // May be nil, if the session hasn't been initialized yet.
-func (s *hmacSession) NonceTPM() TPM2BNonce { return s.nonceTPM }
+func (s *hmacSession) NonceTPM() TPM2BNonce {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nonceTPM
+}
 
 // To avoid a circular dependency on gotpm by tpm2, implement a
 // tiny serialization by hand for TPMASession here
@@ -529,6 +568,8 @@ func hmacKeyFromAuthValue(auth []byte) []byte {
 
 // NewNonceCaller updates the nonceCaller for this session.
 func (s *hmacSession) NewNonceCaller() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := rand.Read(s.nonceCaller.Buffer)
 	return err
 }
@@ -536,6 +577,8 @@ func (s *hmacSession) NewNonceCaller() error {
 // Authorize computes the authorization structure for the session.
 // Unlike the TPM spec, authIndex is zero-based.
 func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, authIndex int) (*TPMSAuthCommand, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.handle == TPMRHNull {
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
@@ -571,27 +614,56 @@ func (s *hmacSession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2B
 }
 
 // updateAuth implements the authUpdater interface.
+// The new value is only staged: it is used to validate the response of the
+// in-flight auth-changing command, and it replaces the session's
+// authorization value only when commitAuth is called.
 func (s *hmacSession) updateAuth(auth []byte) {
-	s.auth = auth
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stagedAuth = auth
+	s.stagedAuthSet = true
+}
+
+// commitAuth implements the authUpdater interface.
+func (s *hmacSession) commitAuth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stagedAuthSet {
+		s.auth = s.stagedAuth
+		s.stagedAuth = nil
+		s.stagedAuthSet = false
+	}
+}
+
+// rollbackAuth implements the authUpdater interface.
+func (s *hmacSession) rollbackAuth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stagedAuth = nil
+	s.stagedAuthSet = false
 }
 
 // Validate validates the response session structure for the session.
-// It updates nonceTPM from the TPM's response.
+// It updates nonceTPM from the TPM's response, but only after the response
+// has been authenticated: the nonce roll and the auth change commit
+// atomically with the success of the command.
 func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BName, authIndex int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
-	s.nonceTPM = auth.Nonce
-	// Track the session being automatically flushed.
-	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Part 1, 19.6
 	// HMAC key is (sessionKey || auth) unless this session is authorizing
 	// its bind target
+	// If an auth-changing command staged a new authorization value, the
+	// TPM computed the response HMAC with it.
+	authValue := s.auth
+	if s.stagedAuthSet {
+		authValue = s.stagedAuth
+	}
 	var hmacKey []byte
 	hmacKey = append(hmacKey, s.sessionKey...)
 	if len(s.bindName.Buffer) == 0 || authIndex >= len(names) || !bytes.Equal(names[authIndex].Buffer, s.bindName.Buffer) {
-		hmacKey = append(hmacKey, hmacKeyFromAuthValue(s.auth)...)
+		hmacKey = append(hmacKey, hmacKeyFromAuthValue(authValue)...)
 	}
 
 	// Compute the authorization HMAC.
@@ -599,7 +671,7 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	if err != nil {
 		return err
 	}
-	mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+	mac, err := computeHMAC(s.hash, hmacKey, rph, auth.Nonce.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 	if err != nil {
 		return err
 	}
@@ -607,23 +679,35 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	if !hmac.Equal(mac, auth.Authorization.Buffer) {
 		return fmt.Errorf("incorrect authorization HMAC")
 	}
+	// The response is authenticated: commit the nonce roll and track the
+	// session being automatically flushed.
+	s.nonceTPM = auth.Nonce
+	if !auth.Attributes.ContinueSession {
+		s.handle = TPMRHNull
+	}
 	return nil
 }
 
 // IsEncryption returns true if this is an encryption session.
 func (s *hmacSession) IsEncryption() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.attrs.Encrypt
 }
 
 // IsDecryption returns true if this is a decryption session.
 func (s *hmacSession) IsDecryption() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.attrs.Decrypt
 }
 
 // Encrypt decrypts the parameter in place, if this session is used for
 // parameter decryption. Otherwise, it does not modify the parameter.
 func (s *hmacSession) Encrypt(parameter []byte) error {
-	if !s.IsDecryption() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.attrs.Decrypt {
 		return nil
 	}
 	// Only AES-CFB is supported.
@@ -654,7 +738,9 @@ func (s *hmacSession) Encrypt(parameter []byte) error {
 // Decrypt encrypts the parameter in place, if this session is used for
 // parameter encryption. Otherwise, it does not modify the parameter.
 func (s *hmacSession) Decrypt(parameter []byte) error {
-	if !s.IsEncryption() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.attrs.Encrypt {
 		return nil
 	}
 	// Only AES-CFB is supported.
@@ -687,6 +773,8 @@ func (s *hmacSession) Decrypt(parameter []byte) error {
 // If the session is created with HMAC (instead of HMACSession) this will be
 // TPM_RH_NULL.
 func (s *hmacSession) Handle() TPMHandle {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.handle
 }
 
@@ -705,7 +793,20 @@ type policySession struct {
 	nonceCaller TPM2BNonce
 	// last nonceTPM
 	nonceTPM TPM2BNonce
+	// stagedAuth, if stagedAuthSet is true, is the new authorization
+	// value of the entity this session authorizes, staged by an
+	// in-flight auth-changing command (see authChanger). The TPM
+	// computes the response HMAC of such a command with the new value,
+	// so the staged value is needed to validate the response, but it
+	// only replaces the session's authorization value once the command
+	// has succeeded and its response has been authenticated.
+	stagedAuth    []byte
+	stagedAuthSet bool
 	callback *PolicyCallback
+	// mu serializes access to the mutable session state, so that
+	// concurrent commands cannot observe or create torn authorization
+	// state (e.g., a half-committed auth change or nonce roll).
+	mu sync.Mutex
 }
 
 // Policy sets up a just-in-time policy session that created each time it's
@@ -763,18 +864,39 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 
 // Init initializes the session, just in time, if needed.
 func (s *policySession) Init(t transport.TPM) error {
+	callback, handle, nonceTPM, err := s.init(t)
+	if err != nil {
+		return err
+	}
+	// Call the callback to execute the policy, if needed.
+	// The callback executes its own TPM commands, so it must not run
+	// while this session's lock is held.
+	if callback != nil {
+		if err := (*callback)(t, handle, nonceTPM); err != nil {
+			return fmt.Errorf("executing policy: %w", err)
+		}
+	}
+	return nil
+}
+
+// init initializes the session, just in time, if needed. If the session
+// was just initialized, it returns the policy callback to invoke (which
+// must run without this session's lock held), the session handle, and the
+// first nonceTPM.
+func (s *policySession) init(t transport.TPM) (*PolicyCallback, TPMHandle, TPM2BNonce, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.handle != TPMRHNull {
 		// Session is already initialized.
-		return nil
+		return nil, s.handle, s.nonceTPM, nil
 	}
-
 	// Get a high-quality nonceCaller for our use.
 	// Store it with the session object for later reference.
 	s.nonceCaller = TPM2BNonce{
 		Buffer: make([]byte, s.nonceSize),
 	}
 	if _, err := rand.Read(s.nonceCaller.Buffer); err != nil {
-		return err
+		return nil, 0, TPM2BNonce{}, err
 	}
 
 	sessType := TPMSEPolicy
@@ -797,13 +919,13 @@ func (s *policySession) Init(t transport.TPM) error {
 		var encSalt *TPM2BEncryptedSecret
 		encSalt, salt, err = getEncryptedSalt(s.saltPub)
 		if err != nil {
-			return err
+			return nil, 0, TPM2BNonce{}, err
 		}
 		sasCmd.EncryptedSalt = *encSalt
 	}
 	sasRsp, err := sasCmd.Execute(t)
 	if err != nil {
-		return err
+		return nil, 0, TPM2BNonce{}, err
 	}
 	s.handle = TPMHandle(sasRsp.SessionHandle.HandleValue())
 	s.nonceTPM = sasRsp.NonceTPM
@@ -814,23 +936,18 @@ func (s *policySession) Init(t transport.TPM) error {
 		authSalt = append(authSalt, salt...)
 		ha, err := s.hash.Hash()
 		if err != nil {
-			return err
+			return nil, 0, TPM2BNonce{}, err
 		}
 		s.sessionKey = KDFa(ha, authSalt, "ATH", s.nonceTPM.Buffer, s.nonceCaller.Buffer, ha.Size()*8)
 	}
 
-	// Call the callback to execute the policy, if needed
-	if s.callback != nil {
-		if err := (*s.callback)(t, s.handle, s.nonceTPM); err != nil {
-			return fmt.Errorf("executing policy: %w", err)
-		}
-	}
-
-	return nil
+	return s.callback, s.handle, s.nonceTPM, nil
 }
 
 // CleanupFailure cleans up the session, if needed.
 func (s *policySession) CleanupFailure(t transport.TPM) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
 		return nil
@@ -845,16 +962,24 @@ func (s *policySession) CleanupFailure(t transport.TPM) error {
 
 // NonceTPM returns the last nonceTPM value from the session.
 // May be nil, if the session hasn't been initialized yet.
-func (s *policySession) NonceTPM() TPM2BNonce { return s.nonceTPM }
+func (s *policySession) NonceTPM() TPM2BNonce {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nonceTPM
+}
 
 // NewNonceCaller updates the nonceCaller for this session.
 func (s *policySession) NewNonceCaller() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err := rand.Read(s.nonceCaller.Buffer)
 	return err
 }
 
 // Authorize computes the authorization structure for the session.
 func (s *policySession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, _ int) (*TPMSAuthCommand, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.handle == TPMRHNull {
 		// Session is not initialized.
 		return nil, fmt.Errorf("session not initialized")
@@ -896,21 +1021,44 @@ func (s *policySession) Authorize(cc TPMCC, parms, addNonces []byte, names []TPM
 // The TPM includes the authorization value in the HMAC of a policy session
 // only after TPM2_PolicyAuthValue, so the auth value is only replaced when
 // the session was given one (with Auth), even an empty one.
+// The new value is only staged: it is used to validate the response of the
+// in-flight auth-changing command, and it replaces the session's
+// authorization value only when commitAuth is called.
 func (s *policySession) updateAuth(auth []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.authSet && !s.password {
-		s.auth = auth
+		s.stagedAuth = auth
+		s.stagedAuthSet = true
 	}
 }
 
-// Validate valitades the response session structure for the session.
-// Updates nonceTPM from the TPM's response.
-func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName, _ int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
-	s.nonceTPM = auth.Nonce
-	// Track the session being automatically flushed.
-	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
+// commitAuth implements the authUpdater interface.
+func (s *policySession) commitAuth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stagedAuthSet {
+		s.auth = s.stagedAuth
+		s.stagedAuth = nil
+		s.stagedAuthSet = false
 	}
+}
+
+// rollbackAuth implements the authUpdater interface.
+func (s *policySession) rollbackAuth() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stagedAuth = nil
+	s.stagedAuthSet = false
+}
+
+// Validate validates the response session structure for the session.
+// It updates nonceTPM from the TPM's response, but only after the response
+// has been authenticated: the nonce roll and the auth change commit
+// atomically with the success of the command.
+func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName, _ int, auth *TPMSAuthResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.password {
 		// If we used a password, expect no nonce and no response HMAC.
@@ -923,15 +1071,21 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 	} else {
 		// Part 1, 19.6
 		// HMAC key is (sessionKey || auth).
+		// If an auth-changing command staged a new authorization value,
+		// the TPM computed the response HMAC with it.
+		authValue := s.auth
+		if s.stagedAuthSet {
+			authValue = s.stagedAuth
+		}
 		var hmacKey []byte
 		hmacKey = append(hmacKey, s.sessionKey...)
-		hmacKey = append(hmacKey, hmacKeyFromAuthValue(s.auth)...)
+		hmacKey = append(hmacKey, hmacKeyFromAuthValue(authValue)...)
 		// Compute the authorization HMAC.
 		rph, err := rpHash(s.hash, rc, cc, parms)
 		if err != nil {
 			return err
 		}
-		mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+		mac, err := computeHMAC(s.hash, hmacKey, rph, auth.Nonce.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 		if err != nil {
 			return err
 		}
@@ -940,23 +1094,35 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 			return fmt.Errorf("incorrect authorization HMAC")
 		}
 	}
+	// The response is authenticated: commit the nonce roll and track the
+	// session being automatically flushed.
+	s.nonceTPM = auth.Nonce
+	if !auth.Attributes.ContinueSession {
+		s.handle = TPMRHNull
+	}
 	return nil
 }
 
 // IsEncryption returns true if this is an encryption session.
 func (s *policySession) IsEncryption() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.attrs.Encrypt
 }
 
 // IsDecryption returns true if this is a decryption session.
 func (s *policySession) IsDecryption() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.attrs.Decrypt
 }
 
 // Encrypt encrypts the parameter in place, if this session is used for
 // parameter decryption. Otherwise, it does not modify the parameter.
 func (s *policySession) Encrypt(parameter []byte) error {
-	if !s.IsDecryption() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.attrs.Decrypt {
 		return nil
 	}
 	// Only AES-CFB is supported.
@@ -987,7 +1153,9 @@ func (s *policySession) Encrypt(parameter []byte) error {
 // Decrypt decrypts the parameter in place, if this session is used for
 // parameter encryption. Otherwise, it does not modify the parameter.
 func (s *policySession) Decrypt(parameter []byte) error {
-	if !s.IsEncryption() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.attrs.Encrypt {
 		return nil
 	}
 	// Only AES-CFB is supported.
@@ -1020,5 +1188,7 @@ func (s *policySession) Decrypt(parameter []byte) error {
 // If the session is created with Policy (instead of PolicySession) this will be
 // TPM_RH_NULL.
 func (s *policySession) Handle() TPMHandle {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.handle
 }

@@ -102,14 +102,32 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 		// We don't need the TPM RC here because we would have errored
 		// out from rspHeader
 		// TODO: Authenticate the error code with sessions, if desired.
+		// If the command changes the authorization value of its target
+		// (see authChanger), the TPM computes the response HMAC with the
+		// new value: stage it on the target's session so the response can
+		// be validated. The staged value is committed only once the
+		// response has been authenticated, so that the target's
+		// authorization value, the session's nonces, and the TPM's
+		// persistent state all change in a single commit. If the command
+		// fails or its response cannot be authenticated, the staged
+		// value is rolled back and the session keeps the authorization
+		// value that still matches the TPM's state.
+		var staged authUpdater
 		if c, ok := any(cmd).(authChanger); ok {
 			if s, ok := sess[0].(authUpdater); ok {
 				s.updateAuth(c.newAuth())
+				staged = s
 			}
 		}
 		err = rspSessions(rspBuf, TPMRCSuccess, cc, names, rspParms, sess)
 		if err != nil {
+			if staged != nil {
+				staged.rollbackAuth()
+			}
 			return err
+		}
+		if staged != nil {
+			staged.commitAuth()
 		}
 	}
 	err = rspParameters(rspParms, sess, rsp)
