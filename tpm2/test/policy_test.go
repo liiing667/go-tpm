@@ -3,6 +3,7 @@ package tpm2test
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"testing"
 
 	. "github.com/google/go-tpm/tpm2"
@@ -491,6 +492,201 @@ func TestPolicyPCR(t *testing.T) {
 		})
 	}
 
+}
+
+// TestPolicySessionRetryAfterMidPolicyFailure verifies that a just-in-time
+// policy session whose callback fails partway through its policy commands is
+// discarded. The next command must not reuse the partial policy digest from
+// the failed attempt. Instead, it creates a new session, takes a fresh PCR
+// snapshot, and re-executes the complete policy.
+func TestPolicySessionRetryAfterMidPolicyFailure(t *testing.T) {
+	thetpm := testhelper.Open(t)
+	defer thetpm.Close()
+
+	selection := TPMLPCRSelection{
+		PCRSelections: []TPMSPCRSelection{
+			{
+				Hash:      TPMAlgSHA256,
+				PCRSelect: PCClientCompatible.PCRs(0, 1, 2, 3, 7),
+			},
+		},
+	}
+
+	expectedDigest := getExpectedPCRDigest(t, thetpm, selection, TPMAlgSHA256)
+	wrongDigest := sha256.Sum256(expectedDigest)
+
+	// The complete policy is a sequence of two PolicyPCR commands.
+	// Calculate the digests of the complete sequence and of the partial
+	// (first-command-only) sequence that a failed attempt leaves behind.
+	pcrPolicy := PolicyPCR{
+		PcrDigest: TPM2BDigest{Buffer: expectedDigest},
+		Pcrs:      selection,
+	}
+	partialPolicy, err := NewPolicyCalculator(TPMAlgSHA256)
+	if err != nil {
+		t.Fatalf("creating policy calculator: %v", err)
+	}
+	if err := pcrPolicy.Update(partialPolicy); err != nil {
+		t.Fatalf("calculating partial policy: %v", err)
+	}
+	partialDigest := partialPolicy.Hash().Digest
+	completePolicy, err := NewPolicyCalculator(TPMAlgSHA256)
+	if err != nil {
+		t.Fatalf("creating policy calculator: %v", err)
+	}
+	if err := pcrPolicy.Update(completePolicy); err != nil {
+		t.Fatalf("calculating complete policy: %v", err)
+	}
+	if err := pcrPolicy.Update(completePolicy); err != nil {
+		t.Fatalf("calculating complete policy: %v", err)
+	}
+	completeDigest := completePolicy.Hash().Digest
+
+	// Create an SRK to parent the sealed blobs.
+	createSRKRsp, err := CreatePrimary{
+		PrimaryHandle: TPMRHOwner,
+		InPublic:      New2B(RSASRKTemplate),
+	}.Execute(thetpm)
+	if err != nil {
+		t.Fatalf("creating SRK: %v", err)
+	}
+	defer func() {
+		if _, err := (FlushContext{FlushHandle: createSRKRsp.ObjectHandle}).Execute(thetpm); err != nil {
+			t.Errorf("flushing SRK: %v", err)
+		}
+	}()
+	srk := NamedHandle{
+		Handle: createSRKRsp.ObjectHandle,
+		Name:   createSRKRsp.Name,
+	}
+
+	secret := []byte("secret data")
+
+	// seal creates and loads a sealed data blob with the given auth policy.
+	seal := func(t *testing.T, authPolicy []byte) NamedHandle {
+		t.Helper()
+		createRsp, err := CreateLoaded{
+			ParentHandle: srk,
+			InSensitive: TPM2BSensitiveCreate{
+				Sensitive: &TPMSSensitiveCreate{
+					Data: NewTPMUSensitiveCreate(&TPM2BSensitiveData{
+						Buffer: secret,
+					}),
+				},
+			},
+			InPublic: New2BTemplate(&TPMTPublic{
+				Type:    TPMAlgKeyedHash,
+				NameAlg: TPMAlgSHA256,
+				ObjectAttributes: TPMAObject{
+					FixedTPM:    true,
+					FixedParent: true,
+					NoDA:        true,
+				},
+				AuthPolicy: TPM2BDigest{Buffer: authPolicy},
+			}),
+		}.Execute(thetpm)
+		if err != nil {
+			t.Fatalf("creating sealed blob: %v", err)
+		}
+		blob := NamedHandle{
+			Handle: createRsp.ObjectHandle,
+			Name:   createRsp.Name,
+		}
+		t.Cleanup(func() {
+			if _, err := (FlushContext{FlushHandle: blob.Handle}).Execute(thetpm); err != nil {
+				t.Errorf("flushing blob: %v", err)
+			}
+		})
+		return blob
+	}
+
+	// runAttempts unseals the blob using a just-in-time policy session whose
+	// callback fails midway through the policy on the first attempt and
+	// completes on the second. It returns the number of times the callback
+	// was invoked and the result of the second attempt.
+	runAttempts := func(t *testing.T, blob NamedHandle) (int, []byte, error) {
+		t.Helper()
+		attempts := 0
+		sess := Policy(TPMAlgSHA256, 16, PolicyCallback(func(tpm transport.TPM, handle TPMISHPolicy, _ TPM2BNonce) error {
+			attempts++
+			// The first PolicyPCR always succeeds, extending the
+			// session's policy digest with a snapshot of the current
+			// PCRs.
+			if _, err := (PolicyPCR{
+				PolicySession: handle,
+				PcrDigest:     TPM2BDigest{Buffer: expectedDigest},
+				Pcrs:          selection,
+			}).Execute(tpm); err != nil {
+				return err
+			}
+			// On the first attempt, the second PolicyPCR fails (as if
+			// the PCRs did not have the expected values), interrupting
+			// the policy midway.
+			digest := expectedDigest
+			if attempts == 1 {
+				digest = wrongDigest[:]
+			}
+			_, err := (PolicyPCR{
+				PolicySession: handle,
+				PcrDigest:     TPM2BDigest{Buffer: digest},
+				Pcrs:          selection,
+			}).Execute(tpm)
+			return err
+		}))
+		unseal := Unseal{
+			ItemHandle: AuthHandle{
+				Handle: blob.Handle,
+				Name:   blob.Name,
+				Auth:   sess,
+			},
+		}
+		// The first attempt fails while executing the policy.
+		if _, err := unseal.Execute(thetpm); err == nil {
+			t.Fatalf("first Unseal succeeded, want failure during policy execution")
+		}
+		// The second attempt must rebuild the session and re-execute the
+		// complete policy from scratch.
+		rsp, err := unseal.Execute(thetpm)
+		if err != nil {
+			return attempts, nil, err
+		}
+		return attempts, rsp.OutData.Buffer, nil
+	}
+
+	t.Run("RetryUsesCompletePolicy", func(t *testing.T) {
+		// The blob's policy is the complete two-command sequence. If the
+		// retry reused the partial digest from the failed first attempt,
+		// the unseal would fail with TPM_RC_POLICY_FAIL.
+		blob := seal(t, completeDigest)
+		attempts, data, err := runAttempts(t, blob)
+		if err != nil {
+			t.Fatalf("second Unseal failed: %v", err)
+		}
+		if attempts != 2 {
+			t.Errorf("policy callback ran %d time(s), want 2 (session must be rebuilt and policy re-executed)", attempts)
+		}
+		if !bytes.Equal(data, secret) {
+			t.Errorf("Unseal returned %x, want %x", data, secret)
+		}
+	})
+
+	t.Run("StalePartialDigestNotReused", func(t *testing.T) {
+		// The blob's policy is the partial one-command sequence: exactly
+		// the digest that the failed first attempt left behind. The retry
+		// must not authorize with that stale digest; the rebuilt session
+		// re-executes the complete policy and the unseal must fail.
+		blob := seal(t, partialDigest)
+		attempts, _, err := runAttempts(t, blob)
+		if err == nil {
+			t.Fatalf("second Unseal succeeded: the stale partial policy digest of another command sequence must not be reused as the current authorization")
+		}
+		if !errors.Is(err, TPMRCPolicyFail) {
+			t.Errorf("second Unseal error = %v, want TPM_RC_POLICY_FAIL", err)
+		}
+		if attempts != 2 {
+			t.Errorf("policy callback ran %d time(s), want 2 (session must be rebuilt and policy re-executed)", attempts)
+		}
+	})
 }
 
 func TestPolicyCpHashUpdate(t *testing.T) {

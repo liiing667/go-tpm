@@ -713,6 +713,11 @@ type policySession struct {
 // Each time the policy is created, the callback is invoked to authorize the
 // session.
 // A real session is created, but just in time, and it is flushed when used.
+// If the callback returns an error, the partially initialized session is
+// discarded. A later use starts a fresh session and re-executes the entire
+// callback, so the policy command sequence, the PCR values it observed, and
+// the resulting policy digest all belong to a single authorization
+// transaction instead of being reused by a different command.
 func Policy(hash TPMIAlgHash, nonceSize int, callback PolicyCallback, opts ...AuthOption) Session {
 	// Set up a one-off session that knows the auth value.
 	sess := policySession{
@@ -762,9 +767,10 @@ func PolicySession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...Aut
 }
 
 // Init initializes the session, just in time, if needed.
-func (s *policySession) Init(t transport.TPM) error {
+func (s *policySession) Init(t transport.TPM) (retErr error) {
 	if s.handle != TPMRHNull {
-		// Session is already initialized.
+		// Session is already initialized. For a callback session this
+		// means the whole policy command sequence completed successfully.
 		return nil
 	}
 
@@ -807,6 +813,21 @@ func (s *policySession) Init(t transport.TPM) error {
 	}
 	s.handle = TPMHandle(sasRsp.SessionHandle.HandleValue())
 	s.nonceTPM = sasRsp.NonceTPM
+
+	// From this point on the TPM session exists. If any part of the
+	// initialization fails, the session holds a policy digest for at most a
+	// prefix of the requested command sequence. Discard it so that a retry
+	// starts a new session, takes a fresh PCR snapshot, and computes a new
+	// digest rather than reusing this transaction's stale state.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if cleanupErr := s.discard(t); cleanupErr != nil {
+			retErr = fmt.Errorf("%w (additionally, could not discard the failed policy session: %v)", retErr, cleanupErr)
+		}
+	}()
+
 	// Part 1, 19.6
 	if s.bindHandle != TPMRHNull || len(salt) != 0 {
 		var authSalt []byte
@@ -829,18 +850,30 @@ func (s *policySession) Init(t transport.TPM) error {
 	return nil
 }
 
+// discard forgets the current TPM session and flushes it if it is still
+// resident. Local session identity is cleared before the flush is attempted,
+// so even if the TPM rejects the flush this object can never appear
+// initialized and reuse the policy digest of a stale command sequence.
+func (s *policySession) discard(t transport.TPM) error {
+	handle := s.handle
+	s.handle = TPMRHNull
+	s.nonceCaller = TPM2BNonce{}
+	s.nonceTPM = TPM2BNonce{}
+	s.sessionKey = nil
+	if handle == TPMRHNull {
+		return nil
+	}
+	_, err := (&FlushContext{FlushHandle: handle}).Execute(t)
+	return err
+}
+
 // CleanupFailure cleans up the session, if needed.
 func (s *policySession) CleanupFailure(t transport.TPM) error {
 	// The user is already responsible to clean up this session.
 	if s.attrs.ContinueSession {
 		return nil
 	}
-	fc := FlushContext{FlushHandle: s.handle}
-	if _, err := fc.Execute(t); err != nil {
-		return err
-	}
-	s.handle = TPMRHNull
-	return nil
+	return s.discard(t)
 }
 
 // NonceTPM returns the last nonceTPM value from the session.
