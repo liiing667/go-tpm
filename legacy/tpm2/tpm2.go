@@ -681,7 +681,16 @@ func LoadUsingAuth(rw io.ReadWriter, parentHandle tpmutil.Handle, auth AuthComma
 	if err != nil {
 		return 0, nil, err
 	}
-	return decodeLoad(resp)
+	handle, name, err := decodeLoad(resp)
+	if err != nil {
+		return 0, nil, err
+	}
+	// Never hand out a handle whose Name does not identify the public area
+	// the caller asked to load.
+	if err := verifyLoadName(rw, publicBlob, name, handle); err != nil {
+		return 0, nil, err
+	}
+	return handle, name, nil
 }
 
 func encodeLoadExternal(pub Public, private Private, hierarchy tpmutil.Handle) ([]byte, error) {

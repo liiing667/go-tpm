@@ -265,6 +265,11 @@ func (cmd Load) Execute(t transport.TPM, s ...Session) (*LoadResponse, error) {
 	if err := execute[LoadResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
 	}
+	// Never hand out a handle whose Name does not identify the public area
+	// the caller asked to load.
+	if err := verifyLoadResponse(t, cmd.InPublic, &rsp); err != nil {
+		return nil, err
+	}
 	return &rsp, nil
 }
 
