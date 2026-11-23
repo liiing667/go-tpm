@@ -200,6 +200,10 @@ type sessionOptions struct {
 	attrs       TPMASession
 	symmetric   TPMTSymDef
 	trialPolicy bool
+	// lockoutAttempt, when set, binds this authorization response to one
+	// dictionary-attack reset generation. A response that arrives after a
+	// reset, policy change, owner recovery, or in-doubt mutation is stale.
+	lockoutAttempt *LockoutAttempt
 }
 
 // defaultOptions represents the default options used when none are provided.
@@ -350,7 +354,9 @@ func HMAC(hash TPMIAlgHash, nonceSize int, opts ...AuthOption) Session {
 	return &sess
 }
 
-// HMACSession sets up a reusable HMAC session that needs to be closed.
+// HMACSession sets up a reusable HMAC session that needs to be closed. Pass
+// LockoutBinding(attempt) as an option to reject a late response that belongs
+// to a superseded dictionary-attack generation.
 func HMACSession(t transport.TPM, hash TPMIAlgHash, nonceSize int, opts ...AuthOption) (s Session, close func() error, err error) {
 	// Set up a not-one-off session that knows the auth value.
 	sess := hmacSession{
@@ -578,6 +584,11 @@ func (s *hmacSession) updateAuth(auth []byte) {
 // Validate validates the response session structure for the session.
 // It updates nonceTPM from the TPM's response.
 func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BName, authIndex int, auth *TPMSAuthResponse) error {
+	if s.lockoutAttempt != nil && s.lockoutAttempt.Stale() {
+		return fmt.Errorf(
+			"%w: authorization session belongs to a superseded lockout generation",
+			ErrStaleLockoutResponse)
+	}
 	// Track the new nonceTPM for the session.
 	s.nonceTPM = auth.Nonce
 	// Track the session being automatically flushed.

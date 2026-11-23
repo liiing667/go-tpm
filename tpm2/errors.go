@@ -442,6 +442,13 @@ func (e TPMFmt1Error) Error() string {
 	return fmt.Sprintf("%s (%v %d): %s", desc.name, e.subject, e.index, desc.description)
 }
 
+// Canonical returns the TPM error code with the handle, parameter, or session
+// selector stripped out. Callers use it to bind a response to the lockout
+// transaction that produced it without depending on the selected index.
+func (e TPMFmt1Error) Canonical() TPMRC {
+	return e.canonical
+}
+
 // Handle returns whether the error is handle-related and if so, which handle is
 // in error.
 func (e TPMFmt1Error) Handle() (bool, int) {
@@ -529,6 +536,15 @@ func (r TPMRC) Error() string {
 		return fmt.Sprintf("%s: %s", desc.name, desc.description)
 	}
 	return fmt.Sprintf("unrecognized error code (0x%x)", uint32(r))
+}
+
+// Canonical returns the error code with any handle, parameter, or session
+// selector stripped out. Format-0 and warning codes are returned unchanged.
+func (r TPMRC) Canonical() TPMRC {
+	if isFmt1, fmt1 := r.isFmt1Error(); isFmt1 {
+		return fmt1.canonical
+	}
+	return r
 }
 
 // Is returns whether the TPMRC (which may be a FMT1 error) is equal to the

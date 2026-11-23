@@ -2309,6 +2309,9 @@ func (DictionaryAttackLockReset) Command() TPMCC { return TPMCCDictionaryAttackL
 
 // Execute executes the command and returns the response.
 func (cmd DictionaryAttackLockReset) Execute(t transport.TPM, s ...Session) (*DictionaryAttackLockResetResponse, error) {
+	if err := cmd.Validate(); err != nil {
+		return nil, err
+	}
 	var rsp DictionaryAttackLockResetResponse
 	if err := execute[DictionaryAttackLockResetResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
@@ -2338,6 +2341,9 @@ func (DictionaryAttackParameters) Command() TPMCC { return TPMCCDictionaryAttack
 
 // Execute executes the command and returns the response.
 func (cmd DictionaryAttackParameters) Execute(t transport.TPM, s ...Session) (*DictionaryAttackParametersResponse, error) {
+	if err := cmd.Validate(); err != nil {
+		return nil, err
+	}
 	var rsp DictionaryAttackParametersResponse
 	if err := execute[DictionaryAttackParametersResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
