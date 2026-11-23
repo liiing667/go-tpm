@@ -23,32 +23,80 @@ const (
 
 // execute sends the provided command and returns the TPM's response.
 func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Session) error {
+	err, _, _, _ := executeWithRaw[R](t, cmd, rsp, extraSess...)
+	return err
+}
+
+// commandAuditInfo carries the pieces of an executed transaction that the
+// audit digest is defined over (Part 1, section 32.4). They are captured
+// during execution so that auditing cannot disagree with what was actually
+// sent to and received from the TPM.
+type commandAuditInfo struct {
+	// cc is the command code of the executed command.
+	cc TPMCC
+	// rc is the TPM response code; executeWithRaw only returns this struct
+	// when rc is TPM_RC_SUCCESS.
+	rc TPMRC
+	// names are the Names of the command's handle area (nil if there are
+	// no handles).
+	names []TPM2BName
+	// cmdParms is the command parameter area, with any decrypt-session
+	// encryption removed.
+	cmdParms []byte
+	// rspParms is the response parameter area, with any encrypt-session
+	// encryption removed.
+	rspParms []byte
+}
+
+// executeWithRaw sends the provided command and returns the TPM's response.
+// In addition to the error, it returns the exact raw command bytes that were
+// sent and the exact raw response bytes that came back from the TPM. This lets
+// callers (such as the command-audit machinery) audit the same transaction
+// that was actually executed, instead of re-deriving a potentially different
+// serialization from the Go structs.
+//
+// The raw bytes are only returned together with a nil error: a failed
+// execution returns nil command and response bytes, so callers cannot
+// accidentally fold an error response into a success-only audit digest.
+func executeWithRaw[R any](
+	t transport.TPM,
+	cmd Command[R, *R],
+	rsp *R,
+	extraSess ...Session,
+) (err error, command []byte, response []byte, audit *commandAuditInfo) {
 	cc := cmd.Command()
 	sess, err := cmdAuths(cmd)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
 	}
 	sess = append(sess, extraSess...)
 	if len(sess) > 3 {
-		return fmt.Errorf("too many sessions: %v", len(sess))
+		return fmt.Errorf("too many sessions: %v", len(sess)), nil, nil, nil
 	}
 	hasSessions := len(sess) > 0
 	// Initialize the sessions, if needed
 	for i, s := range sess {
 		if err := s.Init(t); err != nil {
-			return fmt.Errorf("initializing session %d: %w", i, err)
+			return fmt.Errorf("initializing session %d: %w", i, err), nil, nil, nil
 		}
 		if err := s.NewNonceCaller(); err != nil {
-			return err
+			return err, nil, nil, nil
 		}
 	}
 	handles, err := cmdHandles(cmd)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
 	}
 	parms, err := cmdParameters(cmd, sess)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
+	}
+	// The audit cpHash is defined over the unencrypted command parameters;
+	// compute them separately so a decrypt session never changes the audit
+	// preimage.
+	auditCmdParms, err := cmdParameters(cmd, nil)
+	if err != nil {
+		return err, nil, nil, nil
 	}
 	var names []TPM2BName
 	var sessions []byte
@@ -56,22 +104,22 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 		var err error
 		names, err = cmdNames(cmd)
 		if err != nil {
-			return err
+			return err, nil, nil, nil
 		}
 		sessions, err = cmdSessions(sess, cc, names, parms)
 		if err != nil {
-			return err
+			return err, nil, nil, nil
 		}
 	}
-	command := cmdHeader(hasSessions, 10 /* size of command header */ +len(handles)+len(sessions)+len(parms), cc)
+	command = cmdHeader(hasSessions, 10 /* size of command header */ +len(handles)+len(sessions)+len(parms), cc)
 	command = append(command, handles...)
 	command = append(command, sessions...)
 	command = append(command, parms...)
 
 	// Send the command via the transport.
-	response, err := t.Send(command)
+	response, err = t.Send(command)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
 	}
 
 	// Parse the command tpm2ly into the response structure.
@@ -86,17 +134,20 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 			}
 		}
 		if len(bonusErrs) != 0 {
-			return fmt.Errorf("%w - additional errors encountered during cleanup: %v", err, strings.Join(bonusErrs, ", "))
+			return fmt.Errorf(
+				"%w - additional errors encountered during cleanup: %v",
+				err, strings.Join(bonusErrs, ", "),
+			), nil, nil, nil
 		}
-		return err
+		return err, nil, nil, nil
 	}
 	err = rspHandles(rspBuf, rsp)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
 	}
 	rspParms, err := rspParametersArea(hasSessions, rspBuf)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
 	}
 	if hasSessions {
 		// We don't need the TPM RC here because we would have errored
@@ -109,15 +160,28 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 		}
 		err = rspSessions(rspBuf, TPMRCSuccess, cc, names, rspParms, sess)
 		if err != nil {
-			return err
+			return err, nil, nil, nil
 		}
 	}
 	err = rspParameters(rspParms, sess, rsp)
 	if err != nil {
-		return err
+		return err, nil, nil, nil
+	}
+	// The audit rpHash is defined over the unencrypted response parameters;
+	// re-marshal the populated response struct instead of reusing wire bytes
+	// that an encrypt session may have scrambled.
+	auditRspParms, err := marshalRspParameters(rsp, nil)
+	if err != nil {
+		return err, nil, nil, nil
 	}
 
-	return nil
+	return nil, command, response, &commandAuditInfo{
+		cc:       cc,
+		rc:       TPMRCSuccess,
+		names:    names,
+		cmdParms: auditCmdParms,
+		rspParms: auditRspParms,
+	}
 }
 
 func isMarshalledByReflection(v reflect.Value) bool {
