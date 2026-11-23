@@ -76,19 +76,43 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 
 	// Parse the command tpm2ly into the response structure.
 	rspBuf := bytes.NewBuffer(response)
-	err = rspHeader(rspBuf)
+	var hdr TPMRspHeader
+	err = unmarshal(rspBuf, reflect.ValueOf(&hdr).Elem())
 	if err != nil {
-		var bonusErrs []string
-		// Emergency cleanup, then return.
-		for _, s := range sess {
-			if err := s.CleanupFailure(t); err != nil {
-				bonusErrs = append(bonusErrs, err.Error())
+		// No trustworthy response code or authorization area can be
+		// recovered from an unparseable response.
+		return cleanupSessions(t, sess, fmt.Errorf("unmarshalling TPM response: %w", err))
+	}
+	rc := hdr.ResponseCode
+	if rc != TPMRCSuccess {
+		// The TPM rejected the command. Per Part 3, "Authorization
+		// Failures" and Part 1, 21.4, a response to a command that used
+		// sessions still carries an authorization area, and each
+		// session remains alive with the response attributes set
+		// accordingly. Validate it and roll the sessions forward so
+		// that a reusable session keeps the TPM's fresh nonceTPM (and
+		// learns if the TPM flushed it) instead of reusing the stale
+		// pre-failure nonce on the next command.
+		if hasSessions && hdr.Tag == TPMSTSessions {
+			// Error responses have no handles, only a (normally empty)
+			// length-prefixed parameter area and the authorization area.
+			errRspParms, err := rspParametersArea(true, rspBuf)
+			if err != nil {
+				return cleanupSessions(t, sess, err)
+			}
+			if err := rspSessions(rspBuf, rc, cc, names, errRspParms, sess); err != nil {
+				// The error response itself could not be authenticated
+				// (or was malformed). The sessions may no longer match
+				// the TPM's state, so clean them up before returning.
+				return cleanupSessions(t, sess, err)
+			}
+			if rspBuf.Len() != 0 {
+				return cleanupSessions(t, sess,
+					fmt.Errorf("%w: %d unaccounted-for bytes at the end of the TPM response",
+						rc, rspBuf.Len()))
 			}
 		}
-		if len(bonusErrs) != 0 {
-			return fmt.Errorf("%w - additional errors encountered during cleanup: %v", err, strings.Join(bonusErrs, ", "))
-		}
-		return err
+		return rc
 	}
 	err = rspHandles(rspBuf, rsp)
 	if err != nil {
@@ -99,9 +123,8 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 		return err
 	}
 	if hasSessions {
-		// We don't need the TPM RC here because we would have errored
-		// out from rspHeader
-		// TODO: Authenticate the error code with sessions, if desired.
+		// We don't need the TPM RC here because a non-success RC is
+		// handled above (its sessions are validated there, too).
 		if c, ok := any(cmd).(authChanger); ok {
 			if s, ok := sess[0].(authUpdater); ok {
 				s.updateAuth(c.newAuth())
@@ -118,6 +141,23 @@ func execute[R any](t transport.TPM, cmd Command[R, *R], rsp *R, extraSess ...Se
 	}
 
 	return nil
+}
+
+// cleanupSessions runs failure cleanup for all of the command's sessions and
+// returns the original error, annotated with any cleanup errors. It keeps the
+// original error code (e.g. a TPMRC) discoverable via errors.Is/errors.As.
+func cleanupSessions(t transport.TPM, sess []Session, origErr error) error {
+	var bonusErrs []string
+	for _, s := range sess {
+		if err := s.CleanupFailure(t); err != nil {
+			bonusErrs = append(bonusErrs, err.Error())
+		}
+	}
+	if len(bonusErrs) != 0 {
+		return fmt.Errorf("%w - additional errors encountered during cleanup: %v",
+			origErr, strings.Join(bonusErrs, ", "))
+	}
+	return origErr
 }
 
 func isMarshalledByReflection(v reflect.Value) bool {
@@ -1136,20 +1176,6 @@ func cmdHeader(hasSessions bool, length int, cc TPMCC) []byte {
 	buf := bytes.NewBuffer(make([]byte, 0, 8))
 	marshal(buf, reflect.ValueOf(hdr))
 	return buf.Bytes()
-}
-
-// rspHeader parses the response header. If the TPM returned an error,
-// returns an error here.
-// rsp is updated to point to the rest of the response after the header.
-func rspHeader(rsp *bytes.Buffer) error {
-	var hdr TPMRspHeader
-	if err := unmarshal(rsp, reflect.ValueOf(&hdr).Elem()); err != nil {
-		return fmt.Errorf("unmarshalling TPM response: %w", err)
-	}
-	if hdr.ResponseCode != TPMRCSuccess {
-		return hdr.ResponseCode
-	}
-	return nil
 }
 
 // rspHandles parses the response handles area into the response structure.
