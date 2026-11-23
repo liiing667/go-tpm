@@ -7,10 +7,16 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/google/go-tpm/tpm2/transport"
 )
+
+// ErrSessionAuthorization indicates that a response session could not be
+// authenticated. The response nonceTPM and continuation attributes are not
+// committed when this error is returned.
+var ErrSessionAuthorization = errors.New("tpm2: session response authorization failed")
 
 // Session represents a session in the TPM.
 type Session interface {
@@ -35,7 +41,7 @@ type Session interface {
 	// nonceTPMs from each of them, respectively (see Part 1, 19.6.5)
 	Authorize(cc TPMCC, parms, addNonces []byte, names []TPM2BName, authIndex int) (*TPMSAuthCommand, error)
 	// Validates the response for the session.
-	// Updates NonceTPM for the session.
+	// Updates NonceTPM for the session only after the response is authenticated.
 	Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BName, authIndex int, auth *TPMSAuthResponse) error
 	// Returns true if this is an encryption session.
 	IsEncryption() bool
@@ -121,16 +127,16 @@ func (s *pwSession) Authorize(_ TPMCC, _, _ []byte, _ []TPM2BName, _ int) (*TPMS
 // Validates the response session structure for the session.
 func (s *pwSession) Validate(_ TPMRC, _ TPMCC, _ []byte, _ []TPM2BName, _ int, auth *TPMSAuthResponse) error {
 	if len(auth.Nonce.Buffer) != 0 {
-		return fmt.Errorf("expected empty nonce in response auth to PW session, got %x", auth.Nonce)
+		return fmt.Errorf("%w: expected empty nonce in response auth to PW session, got %x", ErrSessionAuthorization, auth.Nonce)
 	}
 	expectedAttrs := TPMASession{
 		ContinueSession: true,
 	}
 	if auth.Attributes != expectedAttrs {
-		return fmt.Errorf("expected only ContinueSession in response auth to PW session, got %v", auth.Attributes)
+		return fmt.Errorf("%w: expected only ContinueSession in response auth to PW session, got %v", ErrSessionAuthorization, auth.Attributes)
 	}
 	if len(auth.Authorization.Buffer) != 0 {
-		return fmt.Errorf("expected empty HMAC in response auth to PW session, got %x", auth.Authorization)
+		return fmt.Errorf("%w: expected empty HMAC in response auth to PW session, got %x", ErrSessionAuthorization, auth.Authorization)
 	}
 	return nil
 }
@@ -576,15 +582,9 @@ func (s *hmacSession) updateAuth(auth []byte) {
 }
 
 // Validate validates the response session structure for the session.
-// It updates nonceTPM from the TPM's response.
+// It updates nonceTPM from the TPM's response only after the response HMAC has
+// been verified.
 func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BName, authIndex int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
-	s.nonceTPM = auth.Nonce
-	// Track the session being automatically flushed.
-	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
-	}
-
 	// Part 1, 19.6
 	// HMAC key is (sessionKey || auth) unless this session is authorizing
 	// its bind target
@@ -599,13 +599,23 @@ func (s *hmacSession) Validate(rc TPMRC, cc TPMCC, parms []byte, names []TPM2BNa
 	if err != nil {
 		return err
 	}
-	mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+	mac, err := computeHMAC(s.hash, hmacKey, rph, auth.Nonce.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 	if err != nil {
 		return err
 	}
-	// Compare the HMAC (constant time)
+	// Compare the HMAC (constant time) before committing any session state.
+	// A response that fails authentication may contain attacker-controlled
+	// nonceTPM, attributes and continuation bits; none of them may become the
+	// starting point for the next command or for parameter encryption.
 	if !hmac.Equal(mac, auth.Authorization.Buffer) {
-		return fmt.Errorf("incorrect authorization HMAC")
+		return fmt.Errorf("%w: incorrect authorization HMAC", ErrSessionAuthorization)
+	}
+
+	// The response is authentic. Only now track the new nonceTPM and the
+	// session being automatically flushed.
+	s.nonceTPM = auth.Nonce
+	if !auth.Attributes.ContinueSession {
+		s.handle = TPMRHNull
 	}
 	return nil
 }
@@ -902,23 +912,17 @@ func (s *policySession) updateAuth(auth []byte) {
 	}
 }
 
-// Validate valitades the response session structure for the session.
-// Updates nonceTPM from the TPM's response.
+// Validate validates the response session structure for the session.
+// It updates nonceTPM from the TPM's response only after the response has been
+// authenticated.
 func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName, _ int, auth *TPMSAuthResponse) error {
-	// Track the new nonceTPM for the session.
-	s.nonceTPM = auth.Nonce
-	// Track the session being automatically flushed.
-	if !auth.Attributes.ContinueSession {
-		s.handle = TPMRHNull
-	}
-
 	if s.password {
 		// If we used a password, expect no nonce and no response HMAC.
 		if len(auth.Nonce.Buffer) != 0 {
-			return fmt.Errorf("expected empty nonce in response auth to PW policy, got %x", auth.Nonce)
+			return fmt.Errorf("%w: expected empty nonce in response auth to PW policy, got %x", ErrSessionAuthorization, auth.Nonce)
 		}
 		if len(auth.Authorization.Buffer) != 0 {
-			return fmt.Errorf("expected empty HMAC in response auth to PW policy, got %x", auth.Authorization)
+			return fmt.Errorf("%w: expected empty HMAC in response auth to PW policy, got %x", ErrSessionAuthorization, auth.Authorization)
 		}
 	} else {
 		// Part 1, 19.6
@@ -931,14 +935,21 @@ func (s *policySession) Validate(rc TPMRC, cc TPMCC, parms []byte, _ []TPM2BName
 		if err != nil {
 			return err
 		}
-		mac, err := computeHMAC(s.hash, hmacKey, rph, s.nonceTPM.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
+		mac, err := computeHMAC(s.hash, hmacKey, rph, auth.Nonce.Buffer, s.nonceCaller.Buffer, nil, auth.Attributes)
 		if err != nil {
 			return err
 		}
 		// Compare the HMAC (constant time)
 		if !hmac.Equal(mac, auth.Authorization.Buffer) {
-			return fmt.Errorf("incorrect authorization HMAC")
+			return fmt.Errorf("%w: incorrect authorization HMAC", ErrSessionAuthorization)
 		}
+	}
+
+	// The response is authentic. Only now track the new nonceTPM and the
+	// session being automatically flushed.
+	s.nonceTPM = auth.Nonce
+	if !auth.Attributes.ContinueSession {
+		s.handle = TPMRHNull
 	}
 	return nil
 }

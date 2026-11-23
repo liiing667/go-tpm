@@ -486,7 +486,9 @@ type CreateLoadedResponse struct {
 	Name TPM2BName
 }
 
-// EncryptDecrypt2 is the input to TPM2_EncryptDecrypt2
+// EncryptDecrypt2 is the input to TPM2_EncryptDecrypt2.
+// For multi-chunk data, use EncryptDecryptSequence so the key object, mode, IV
+// and authorization session remain bound to one sequence.
 type EncryptDecrypt2 struct {
 	// reference to public portion of symmetric key to use for encryption
 	KeyHandle handle `gotpm:"handle,auth"`

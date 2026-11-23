@@ -12,8 +12,6 @@ import (
 	"github.com/google/go-tpm/tpm2/transport/testhelper"
 )
 
-const maxDigestBuffer = 1024
-
 func TestAESEncryption(t *testing.T) {
 	theTpm := testhelper.Open(t)
 	t.Cleanup(func() {
@@ -193,31 +191,9 @@ func TestAESEncryptionBlock(t *testing.T) {
 }
 
 func encryptDecryptSymmetric(rwr transport.TPM, keyAuth AuthHandle, iv, data []byte, mode TPMAlgID, decrypt bool) ([]byte, error) {
-	var out, block []byte
-
-	for rest := data; len(rest) > 0; {
-		if len(rest) > maxDigestBuffer {
-			block, rest = rest[:maxDigestBuffer], rest[maxDigestBuffer:]
-		} else {
-			block, rest = rest, nil
-		}
-		r, err := EncryptDecrypt2{
-			KeyHandle: keyAuth,
-			Message: TPM2BMaxBuffer{
-				Buffer: block,
-			},
-			Mode:    mode,
-			Decrypt: decrypt,
-			IV: TPM2BIV{
-				Buffer: iv,
-			},
-		}.Execute(rwr)
-		if err != nil {
-			return nil, err
-		}
-		block = r.OutData.Buffer
-		iv = r.IV.Buffer
-		out = append(out, block...)
+	seq, err := NewEncryptDecryptSequence(rwr, keyAuth, mode, iv, decrypt)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	return seq.ProcessAll(data)
 }
