@@ -323,6 +323,9 @@ func (cmd ReadPublic) Execute(t transport.TPM, s ...Session) (*ReadPublicRespons
 	if err := execute[ReadPublicResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
 	}
+	if err := validateCredentialPublicName(rsp.OutPublic, rsp.Name); err != nil {
+		return nil, err
+	}
 	return &rsp, nil
 }
 
@@ -354,6 +357,34 @@ func (ActivateCredential) Command() TPMCC { return TPMCCActivateCredential }
 
 // Execute executes the command and returns the response.
 func (cmd ActivateCredential) Execute(t transport.TPM, s ...Session) (*ActivateCredentialResponse, error) {
+	// The blob is bound to the Name algorithm of the EK and to a specific
+	// AK Name. Reject malformed or cross-algorithm input before it can reach
+	// the TPM, then snapshot the mutable input buffers for this attempt.
+	if cmd.ActivateHandle != nil {
+		if name := cmd.ActivateHandle.KnownName(); name != nil && len(name.Buffer) != 0 {
+			if err := validateCredentialObjectName(*name); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if cmd.KeyHandle != nil {
+		if name := cmd.KeyHandle.KnownName(); name != nil && len(name.Buffer) != 0 {
+			if err := validateCredentialObjectName(*name); err != nil {
+				return nil, err
+			}
+			if err := validateCredentialBlobHash(cmd.CredentialBlob, *name); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := validateCredentialBlob(cmd.CredentialBlob); err != nil {
+		return nil, err
+	}
+	if len(cmd.Secret.Buffer) == 0 {
+		return nil, ErrCredentialChallengeSecret
+	}
+	cmd.CredentialBlob = TPM2BIDObject{Buffer: cloneCredentialBytes(cmd.CredentialBlob.Buffer)}
+	cmd.Secret = TPM2BEncryptedSecret{Buffer: cloneCredentialBytes(cmd.Secret.Buffer)}
 	var rsp ActivateCredentialResponse
 	if err := execute[ActivateCredentialResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
@@ -383,9 +414,26 @@ func (MakeCredential) Command() TPMCC { return TPMCCMakeCredential }
 
 // Execute executes the command and returns the response.
 func (cmd MakeCredential) Execute(t transport.TPM, s ...Session) (*MakeCredentialResponse, error) {
+	// MakeCredential produces a blob for exactly one AK Name. Reject an
+	// invalid or unbound Name and snapshot the inputs before executing the
+	// command so the same values are used for the whole transaction.
+	if err := validateCredentialObjectName(cmd.ObjectName); err != nil {
+		return nil, err
+	}
+	if len(cmd.Credential.Buffer) > 65535 {
+		return nil, ErrCredentialChallengeCredential
+	}
+	cmd.ObjectName = TPM2BName{Buffer: cloneCredentialBytes(cmd.ObjectName.Buffer)}
+	cmd.Credential = TPM2BDigest{Buffer: cloneCredentialBytes(cmd.Credential.Buffer)}
 	var rsp MakeCredentialResponse
 	if err := execute[MakeCredentialResponse](t, cmd, &rsp, s...); err != nil {
 		return nil, err
+	}
+	if err := validateCredentialBlob(rsp.CredentialBlob); err != nil {
+		return nil, err
+	}
+	if len(rsp.Secret.Buffer) == 0 {
+		return nil, ErrCredentialChallengeSecret
 	}
 	return &rsp, nil
 }
@@ -1628,6 +1676,12 @@ func (CreatePrimary) Command() TPMCC { return TPMCCCreatePrimary }
 func (cmd CreatePrimary) Execute(t transport.TPM, s ...Session) (*CreatePrimaryResponse, error) {
 	var rsp CreatePrimaryResponse
 	if err := execute[CreatePrimaryResponse](t, cmd, &rsp, s...); err != nil {
+		return nil, err
+	}
+	if err := validateCredentialPublicName(rsp.OutPublic, rsp.Name); err != nil {
+		// Do not publish a handle for an object whose public area and Name
+		// were not committed to the same generation.
+		FlushContext{FlushHandle: rsp.ObjectHandle}.Execute(t)
 		return nil, err
 	}
 	return &rsp, nil
